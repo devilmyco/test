@@ -1,0 +1,463 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Web;
+using System.Web.Services;
+
+/// <summary>
+/// WebService 的摘要描述
+/// </summary>
+[WebService(Namespace = "http://tempuri.org/")]
+[WebServiceBinding(ConformsTo = WsiProfiles.BasicProfile1_1)]
+// 若要允許使用 ASP.NET AJAX 從指令碼呼叫此 Web 服務，請取消註解下列一行。
+// [System.Web.Script.Services.ScriptService]
+public class WebService : System.Web.Services.WebService
+{
+
+    public WebService()
+    {
+
+        //如果使用設計的元件，請取消註解下列一行
+        //InitializeComponent(); 
+    }
+
+    [WebMethod]
+    public string HelloWorld()
+    {
+        return "Hello World";
+    }
+
+    [WebMethod]
+    public String prod_order(string item, int qty, string warehouse, string inv_frm_wh,string clsinvrep)
+    {
+        int errorCode = 0;
+        string errorMessage = "";
+        int wo_entry = 0;
+        SAPbobsCOM.Company oCompany = new SAPbobsCOM.Company();
+
+        oCompany.CompanyDB = "MSH_DB_PRD";
+        oCompany.Server = "SAP-ERP";
+        oCompany.LicenseServer = "SAP-ERP";
+        oCompany.DbUserName = "sa";
+        oCompany.DbPassword = "Sb1Admin";
+        oCompany.UserName = "manager";
+        oCompany.Password = "123$rewQ";
+        oCompany.DbServerType = SAPbobsCOM.BoDataServerTypes.dst_MSSQL2017;
+        oCompany.UseTrusted = false;
+        int connectionResult = oCompany.Connect();
+
+        if (connectionResult != 0)
+        {
+            oCompany.GetLastError(out errorCode, out errorMessage);
+            return Convert.ToString(errorCode) + errorMessage;
+        }
+
+        //SAPbobsCOM.ProductionOrders wo = oCompany.GetBusinessObject(SAPbobsCOM.BoObjectTypes.oProductionOrders);
+        //SAPbobsCOM.ProductionOrders wo = (SAPbobsCOM.ProductionOrders)oCompany.GetBusinessObject(SAPbobsCOM.BoObjectTypes.oProductionOrders);
+        SAPbobsCOM.ProductionOrders wo = oCompany.GetBusinessObject(SAPbobsCOM.BoObjectTypes.oProductionOrders) as SAPbobsCOM.ProductionOrders;
+
+        wo.ItemNo = item;
+        wo.DueDate = DateTime.Now.AddDays(7);
+        wo.Warehouse = warehouse;
+        wo.PlannedQuantity = qty;
+        wo.ProductionOrderType = SAPbobsCOM.BoProductionOrderTypeEnum.bopotStandard;
+        //wo.ProductionOrderOrigin = SAPbobsCOM.BoProductionOrderOriginEnum.bopooSalesOrder;
+        //wo.ProductionOrderOriginEntry = Convert.ToInt16(sNewOrderDocEntry);            
+        errorCode = wo.Add();
+        if (errorCode == 0) //if success
+        {
+            SAPbobsCOM.Recordset oRecordSet = (SAPbobsCOM.Recordset)oCompany.GetBusinessObject(SAPbobsCOM.BoObjectTypes.BoRecordset);
+            oRecordSet.DoQuery("SELECT TOP 1 DocNum FROM OWOR ORDER BY DocNum desc");
+            wo_entry = (int)oRecordSet.Fields.Item(0).Value;
+            wo.GetByKey(wo_entry);
+
+            if (wo.ItemNo == item)
+            {
+                //get wo information + lines
+                int i = 0;
+                //string rstring="";
+                string[] wo_lines_item = new string[20]; //for item
+                int[] wo_lines_qty = new int[20];       //for quantity
+                //wo_lines_qty[0] = wo.Lines.Count;
+                for (i = 0; i < wo.Lines.Count; i++)
+                {
+                    wo.Lines.SetCurrentLine(i);
+                    if (wo.Lines.Warehouse != "W-99") //if warehouse != "W-99", add to matrix
+                    {
+                        wo_lines_item[i] = wo.Lines.ItemNo;
+                        wo_lines_qty[i] = Convert.ToInt32(wo.Lines.PlannedQuantity);
+                        //rstring += wo_lines_item[i] + wo_lines_qty[i].ToString();
+                    }
+
+                }
+                //change wo status =R from P 變成已核發
+                string qs = "update owor set status='R' where DocEntry=" + wo_entry.ToString();
+                oRecordSet.DoQuery(qs);
+
+                //add data to inventory transfer request
+                SAPbobsCOM.StockTransfer invreq = (SAPbobsCOM.StockTransfer)oCompany.GetBusinessObject(SAPbobsCOM.BoObjectTypes.oInventoryTransferRequest);
+
+                invreq.FromWarehouse = inv_frm_wh;
+                invreq.CardCode = wo.Warehouse;
+                invreq.Comments = "draft from PO:" + wo_entry.ToString();
+                invreq.DocDate = DateTime.Now.AddDays(7);
+                invreq.DocObjectCode = SAPbobsCOM.BoObjectTypes.oStockTransfer;
+                int j = 0;
+                while (wo_lines_item[j] != null)
+                {
+                    invreq.Lines.ItemCode = wo_lines_item[j];
+                    invreq.Lines.WarehouseCode = wo.Warehouse;
+                    invreq.Lines.Quantity = wo_lines_qty[j];
+                    invreq.Lines.Add();
+                    j += 1;
+                }
+                int errorCode1 = invreq.Add();
+                if (errorCode1 == 0) //if success,get inventory transfer request no. and data, update
+                {
+                    oRecordSet.DoQuery("SELECT TOP 1 Docentry FROM OWTQ ORDER BY Docentry desc");
+                    int invreq_entry = (int)oRecordSet.Fields.Item(0).Value;
+                    //update U_PwC_OWOROWTQ, U_PwC_OPKLType(N:委外, Y:廠內)                     
+                    //SAPbobsCOM.UserFieldsMD udf = (SAPbobsCOM.UserFieldsMD)oCompany.GetBusinessObject(SAPbobsCOM.BoObjectTypes.oUserFields);
+                    //udf.TableName = "OWTQ";
+                    string qstring = "update owtq set U_PwC_OWOROWTQ=" + wo_entry.ToString() + ", U_PwC_OPKLType='N' where DocEntry=" + invreq_entry.ToString();
+                    oRecordSet.DoQuery(qstring);
+
+                    // create inventory transfer document, get inventory transfer data first, and copy to
+                    //get invreq data, add head data
+                    invreq.GetByKey(invreq_entry);
+                    SAPbobsCOM.StockTransfer invtrf = (SAPbobsCOM.StockTransfer)oCompany.GetBusinessObject(SAPbobsCOM.BoObjectTypes.oStockTransfer);
+                    invtrf.DocDate = invreq.DocDate;
+                    invtrf.CardCode = invreq.CardCode;
+                    invtrf.FromWarehouse = invreq.FromWarehouse;
+                    //add inventory transfer lines
+                    int k = 0;
+                    while (wo_lines_item[k] != null)
+                    {
+                        invtrf.Lines.ItemCode = wo_lines_item[k];
+                        invtrf.Lines.WarehouseCode = wo.Warehouse;
+                        invtrf.Lines.Quantity = wo_lines_qty[k];
+                        invtrf.Lines.Add();
+                        k += 1;
+                    }
+                    int errorCode2 = invtrf.Add();
+                    if (errorCode1 == 0) //if success,get inventory transfer no. and data, update
+                    {
+                        oRecordSet.DoQuery("SELECT TOP 1 Docentry FROM OWTR ORDER BY Docentry desc");
+                        int invtrf_entry = (int)oRecordSet.Fields.Item(0).Value;
+                        string qstring1 = "update owtr set U_PwC_OWOROWTQ=" + wo_entry.ToString() + ", U_PwC_OPKLType='N' where DocEntry=" + invtrf_entry.ToString();
+                        oRecordSet.DoQuery(qstring1);
+
+                        //close inventory transfer request
+                        if (clsinvrep =="Y" || clsinvrep=="y")
+                        {
+                            invreq.Close();
+                        }
+                        //return data back
+                        return wo.AbsoluteEntry.ToString() + ",success," + invreq_entry.ToString() + ",success," + invtrf_entry.ToString() + ",success";
+                    }
+                    else
+                    {
+                        int err_code;
+                        string err_msg;
+                        oCompany.GetLastError(out err_code, out err_msg);
+                        return wo.AbsoluteEntry.ToString() + ",success," + invreq_entry.ToString() + ",success," + "0," + err_msg;
+                    }
+                }
+                else
+                {
+                    int err_code;
+                    string err_msg;
+                    oCompany.GetLastError(out err_code, out err_msg);
+                    return wo.AbsoluteEntry.ToString() + ",success," + "0," + err_msg + "0," + "inventory transfer request create fail";
+                }
+            }
+            else
+            {
+                return "0,item doesn't match,0,create prod order fail,0,fail,0,fail";
+            }
+        }
+        else
+        {
+            oCompany.GetLastError(out errorCode, out errorMessage);
+            return "0" + "," + errorMessage + ",0,create prod order fail,0,fail,0,fail";
+        }
+    }
+
+    [WebMethod]
+    public String prod_finish(int wo_entry, string item,int qty, string warehouse)
+    {
+        int errorCode = 0;
+        string errorMessage = "";
+
+        SAPbobsCOM.Company oCompany = new SAPbobsCOM.Company();
+        oCompany.CompanyDB = "MSH_DB_PRD";
+        oCompany.Server = "SAP-ERP";
+        oCompany.LicenseServer = "SAP-ERP";
+        oCompany.DbUserName = "sa";
+        oCompany.DbPassword = "Sb1Admin";
+        oCompany.UserName = "manager";
+        oCompany.Password = "123$rewQ";
+        oCompany.DbServerType = SAPbobsCOM.BoDataServerTypes.dst_MSSQL2017;
+        oCompany.UseTrusted = false;
+        int connectionResult = oCompany.Connect();
+        if (connectionResult != 0)
+        {
+            oCompany.GetLastError(out errorCode, out errorMessage);
+            return Convert.ToString(errorCode) + errorMessage;
+        }
+        SAPbobsCOM.ProductionOrders wo = oCompany.GetBusinessObject(SAPbobsCOM.BoObjectTypes.oProductionOrders) as SAPbobsCOM.ProductionOrders;
+        SAPbobsCOM.Documents invrec = oCompany.GetBusinessObject(SAPbobsCOM.BoObjectTypes.oInventoryGenEntry) as SAPbobsCOM.Documents;
+        int invrec_entry = 0;
+        if (wo.GetByKey(wo_entry) == true) //假如有抓到wo_entry
+        {
+            if (wo.ProductionOrderStatus != SAPbobsCOM.BoProductionOrderStatusEnum.boposReleased) //status=release
+            {
+                return "0,production order status is not released,0, fail,0,0,0";
+            }
+            if (wo.ItemNo != item)
+            {
+                return "0,production item does not match,0, fail,0,0,0";
+            }
+        }
+        else
+        {
+            return "0,production order number is wrong please check,0, fail,0,0,0";
+        }
+        //invrec.DocDate = duedate;
+        invrec.DocDate = DateTime.Now;
+        invrec.JournalMemo = "生產收貨";
+        //invrec.Comments = "生產收貨";
+
+        var invrec_line = invrec.Lines;
+        invrec_line.BaseEntry = wo_entry;
+        //invrec_line.ItemCode = item;        
+        invrec_line.Quantity = qty;
+        invrec_line.WarehouseCode = warehouse;
+        invrec_line.Add();
+        int errorcode = invrec.Add();
+        if (errorcode == 0)
+        {
+            //撈出OIGN 資料
+            SAPbobsCOM.Recordset oRecordSet = (SAPbobsCOM.Recordset)oCompany.GetBusinessObject(SAPbobsCOM.BoObjectTypes.BoRecordset);
+            oRecordSet.DoQuery("SELECT TOP 1 DocNum FROM OIGN ORDER BY DocNum desc");
+            invrec_entry =  (int)oRecordSet.Fields.Item(0).Value;
+
+            //生產訂單完工,將工單plannedqty, cmpltqty撈出比較,cmpltqty=plannedqty 就完工,other not close
+            string qstr = "select cmpltqty,plannedqty from owor where DocEntry=" + wo_entry;
+            oRecordSet.DoQuery(qstr);
+            //撈出cmpltqty=plannedqty 
+            double wo_cmpltqty = 0;
+            double wo_plannedqty = 0;
+            double wo_rest =0;
+            wo_cmpltqty = (double)oRecordSet.Fields.Item("cmpltqty").Value;
+            wo_plannedqty = (double)oRecordSet.Fields.Item("plannedqty").Value;
+            wo_rest =wo_plannedqty-wo_cmpltqty;
+            //return wo_cmpltqty.ToString() + wo_plannedqty.ToString();
+            if (wo_cmpltqty == wo_plannedqty) //完工
+            {
+                wo.ProductionOrderStatus = SAPbobsCOM.BoProductionOrderStatusEnum.boposClosed;
+                if (wo.Update() != 0) //關閉prod失敗
+                {
+                    int err_code;
+                    string err_msg;
+                    oCompany.GetLastError(out err_code, out err_msg);
+                    return invrec_entry.ToString() + ",success," + "0," + err_msg+","+ wo_plannedqty.ToString()+","+wo_cmpltqty.ToString()+","+wo_rest.ToString();
+                }
+                else //關閉prod成功
+                {
+                    return invrec_entry.ToString() + ",success," + wo_entry + ",success," + wo_plannedqty.ToString() + "," + wo_cmpltqty.ToString() + "," + wo_rest.ToString();
+                }
+
+            }
+            //string qstr1 = "SELECT status FROM owor where DocEntry=" + wo_entry;
+            //oRecordSet.DoQuery(qstr1);
+            //string prod_status = (string)oRecordSet.Fields.Item(0).Value;
+            //if (clsprod == "Y" || clsprod == "y")
+            //{
+            //    wo.ProductionOrderStatus = SAPbobsCOM.BoProductionOrderStatusEnum.boposClosed;               
+            //    if (wo.Update() != 0) //關閉prod失敗
+             //   {
+             //       int err_code;
+             //       string err_msg;
+             //       oCompany.GetLastError(out err_code, out err_msg);
+             //       return invrec_entry.ToString() + ",success," + "0," + err_msg;
+             //   }
+             //   else //關閉prod成功
+             //   {
+             //       return invrec_entry.ToString() + ",success," + wo_entry + ",success";
+             //   }
+            //}
+            //沒有要關閉prod
+            else
+            {
+                return invrec_entry.ToString() + ",success," + wo_entry + ",success," + wo_plannedqty.ToString() + "," + wo_cmpltqty.ToString() + "," + wo_rest.ToString(); ;
+            }
+        }
+        else
+        {
+            int err_code;
+            string err_msg;
+            oCompany.GetLastError(out err_code, out err_msg);
+            return "0," + err_msg + ",0,production good receipt fail,0,0,0";
+
+        }
+
+
+    }
+
+    [WebMethod]
+    public String prod_order_test(string item, int qty, string warehouse, string inv_frm_wh, string clsinvrep)
+    {
+        int errorCode = 0;
+        string errorMessage = "";
+        int wo_entry = 0;
+        SAPbobsCOM.Company oCompany = new SAPbobsCOM.Company();
+
+        oCompany.CompanyDB = "MSH_DB_PRD_test6";
+        oCompany.Server = "SAP-ERP";
+        oCompany.LicenseServer = "SAP-ERP";
+        oCompany.DbUserName = "sa";
+        oCompany.DbPassword = "Sb1Admin";
+        oCompany.UserName = "manager";
+        oCompany.Password = "123$rewQ";
+        oCompany.DbServerType = SAPbobsCOM.BoDataServerTypes.dst_MSSQL2017;
+        oCompany.UseTrusted = false;
+        int connectionResult = oCompany.Connect();
+
+        if (connectionResult != 0)
+        {
+            oCompany.GetLastError(out errorCode, out errorMessage);
+            return Convert.ToString(errorCode) + errorMessage;
+        }
+
+        //SAPbobsCOM.ProductionOrders wo = oCompany.GetBusinessObject(SAPbobsCOM.BoObjectTypes.oProductionOrders);
+        //SAPbobsCOM.ProductionOrders wo = (SAPbobsCOM.ProductionOrders)oCompany.GetBusinessObject(SAPbobsCOM.BoObjectTypes.oProductionOrders);
+        SAPbobsCOM.ProductionOrders wo = oCompany.GetBusinessObject(SAPbobsCOM.BoObjectTypes.oProductionOrders) as SAPbobsCOM.ProductionOrders;
+
+        wo.ItemNo = item;
+        wo.DueDate = DateTime.Now.AddDays(7);
+        wo.Warehouse = warehouse;
+        wo.PlannedQuantity = qty;
+        wo.ProductionOrderType = SAPbobsCOM.BoProductionOrderTypeEnum.bopotStandard;
+        //wo.ProductionOrderOrigin = SAPbobsCOM.BoProductionOrderOriginEnum.bopooSalesOrder;
+        //wo.ProductionOrderOriginEntry = Convert.ToInt16(sNewOrderDocEntry);            
+        errorCode = wo.Add();
+        if (errorCode == 0) //if success
+        {
+            SAPbobsCOM.Recordset oRecordSet = (SAPbobsCOM.Recordset)oCompany.GetBusinessObject(SAPbobsCOM.BoObjectTypes.BoRecordset);
+            oRecordSet.DoQuery("SELECT TOP 1 DocNum FROM OWOR ORDER BY DocNum desc");
+            wo_entry = (int)oRecordSet.Fields.Item(0).Value;
+            wo.GetByKey(wo_entry);
+
+            if (wo.ItemNo == item)
+            {
+                //get wo information + lines
+                int i = 0;
+                //string rstring="";
+                string[] wo_lines_item = new string[20]; //for item
+                int[] wo_lines_qty = new int[20];       //for quantity
+                //wo_lines_qty[0] = wo.Lines.Count;
+                for (i = 0; i < wo.Lines.Count; i++)
+                {
+                    wo.Lines.SetCurrentLine(i);
+                    if (wo.Lines.Warehouse != "W-99") //if warehouse != "W-99", add to matrix
+                    {
+                        wo_lines_item[i] = wo.Lines.ItemNo;
+                        wo_lines_qty[i] = Convert.ToInt32(wo.Lines.PlannedQuantity);
+                        //rstring += wo_lines_item[i] + wo_lines_qty[i].ToString();
+                    }
+                    
+                }
+                //change wo status =R from P 變成已核發
+                string qs = "update owor set status='R' where DocEntry=" + wo_entry.ToString();
+                oRecordSet.DoQuery(qs);
+
+                //add data to inventory transfer request
+                SAPbobsCOM.StockTransfer invreq = (SAPbobsCOM.StockTransfer)oCompany.GetBusinessObject(SAPbobsCOM.BoObjectTypes.oInventoryTransferRequest);
+
+                invreq.FromWarehouse = inv_frm_wh;
+                invreq.CardCode = wo.Warehouse;
+                invreq.Comments = "draft from PO:" + wo_entry.ToString();
+                invreq.DocDate = DateTime.Now;
+                invreq.DocObjectCode = SAPbobsCOM.BoObjectTypes.oStockTransfer;
+                int j = 0;
+                while (wo_lines_item[j] != null)
+                {
+                    invreq.Lines.ItemCode = wo_lines_item[j];
+                    invreq.Lines.WarehouseCode = wo.Warehouse;
+                    invreq.Lines.Quantity = wo_lines_qty[j];
+                    invreq.Lines.Add();
+                    j += 1;
+                }
+                int errorCode1 = invreq.Add();
+                if (errorCode1 == 0) //if success,get inventory transfer request no. and data, update
+                {
+                    oRecordSet.DoQuery("SELECT TOP 1 Docentry FROM OWTQ ORDER BY Docentry desc");
+                    int invreq_entry = (int)oRecordSet.Fields.Item(0).Value;
+                    //update U_PwC_OWOROWTQ, U_PwC_OPKLType(N:委外, Y:廠內)                     
+                    //SAPbobsCOM.UserFieldsMD udf = (SAPbobsCOM.UserFieldsMD)oCompany.GetBusinessObject(SAPbobsCOM.BoObjectTypes.oUserFields);
+                    //udf.TableName = "OWTQ";
+                    string qstring = "update owtq set U_PwC_OWOROWTQ=" + wo_entry.ToString() + ", U_PwC_OPKLType='N' where DocEntry=" + invreq_entry.ToString();
+                    oRecordSet.DoQuery(qstring);
+
+                    // create inventory transfer document, get inventory transfer data first, and copy to
+                    //get invreq data, add head data
+                    invreq.GetByKey(invreq_entry);
+                    SAPbobsCOM.StockTransfer invtrf = (SAPbobsCOM.StockTransfer)oCompany.GetBusinessObject(SAPbobsCOM.BoObjectTypes.oStockTransfer);
+                    invtrf.DocDate = invreq.DocDate;
+                    invtrf.CardCode = invreq.CardCode;
+                    invtrf.FromWarehouse = invreq.FromWarehouse;
+                    //add inventory transfer lines
+                    int k = 0;
+                    while (wo_lines_item[k] != null)
+                    {
+                        invtrf.Lines.ItemCode = wo_lines_item[k];
+                        invtrf.Lines.WarehouseCode = wo.Warehouse;
+                        invtrf.Lines.Quantity = wo_lines_qty[k];
+                        invtrf.Lines.Add();
+                        k += 1;
+                    }
+                    int errorCode2 = invtrf.Add();
+                    if (errorCode1 == 0) //if success,get inventory transfer no. and data, update
+                    {
+                        oRecordSet.DoQuery("SELECT TOP 1 Docentry FROM OWTR ORDER BY Docentry desc");
+                        int invtrf_entry = (int)oRecordSet.Fields.Item(0).Value;
+                        string qstring1 = "update owtr set U_PwC_OWOROWTQ=" + wo_entry.ToString() + ", U_PwC_OPKLType='N' where DocEntry=" + invtrf_entry.ToString();
+                        oRecordSet.DoQuery(qstring1);
+
+                        //close inventory transfer request
+                        if (clsinvrep == "Y" || clsinvrep == "y")
+                        {
+                            invreq.Close();
+                        }
+                        //return data back
+                        return wo.AbsoluteEntry.ToString() + ",success," + invreq_entry.ToString() + ",success," + invtrf_entry.ToString() + ",success";
+                    }
+                    else
+                    {
+                        int err_code;
+                        string err_msg;
+                        oCompany.GetLastError(out err_code, out err_msg);
+                        return wo.AbsoluteEntry.ToString() + ",success," + invreq_entry.ToString() + ",success," + "0," + err_msg;
+                    }
+                }
+                else
+                {
+                    int err_code;
+                    string err_msg;
+                    oCompany.GetLastError(out err_code, out err_msg);
+                    return wo.AbsoluteEntry.ToString() + ",success," + "0," + err_msg + "0," + "inventory transfer request create fail";
+                }
+            }
+            else
+            {
+                return "0,item doesn't match,0,create prod order fail,0,fail,0,fail";
+            }
+        }
+        else
+        {
+            oCompany.GetLastError(out errorCode, out errorMessage);
+            return "0" + "," + errorMessage + ",0,create prod order fail,0,fail,0,fail";
+        }
+    }
+}
